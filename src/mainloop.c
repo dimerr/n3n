@@ -362,41 +362,31 @@ static int fdlist_fd_set (fd_set *rd, fd_set *wr) {
     return max_sock;
 }
 
-static void handle_fd (const time_t now, const struct fd_info info, struct n3n_runtime_data *eee) {
-    switch(info.proto) {
+static void handle_fd(const time_t now, const struct fd_info info, struct n3n_runtime_data *eee) {
+    switch (info.proto) {
         case fd_info_proto_unknown:
-            // should not happen!
             assert(false);
             return;
 
         case fd_info_proto_tuntap:
-            // read an ethernet frame from the TAP socket; write on the IP
-            // socket
-            // TODO: change API to tell it which fd
             edge_read_from_tap(eee);
             return;
 
         case fd_info_proto_listen_http: {
             int client = accept(info.fd, NULL, 0);
-            if(client == -1) {
-                // TODO:
-                // - increment error stats
+            if (client == -1) {
                 return;
             }
 
             int slotnr = fdlist_allocslot(client, fd_info_proto_http);
-            if(slotnr < 0) {
-                // TODO:
-                // - increment error stats
+            if (slotnr < 0) {
                 send(client, "HTTP/1.1 503 full\r\n", 19, 0);
                 closesocket(client);
                 return;
             }
 
             int connnr = connlist_alloc(CONN_PROTO_HTTP);
-            if(connnr < 0) {
-                // TODO:
-                // - increment error stats
+            if (connnr < 0) {
                 send(client, "HTTP/1.1 503 full\r\n", 19, 0);
                 closesocket(client);
                 fdlist_freefd(client);
@@ -405,14 +395,13 @@ static void handle_fd (const time_t now, const struct fd_info info, struct n3n_r
 
             fdlist[slotnr].connnr = connnr;
             conn_accept(&connlist[connnr], client, CONN_PROTO_HTTP);
-
             return;
         }
 
         case fd_info_proto_v3udp: {
             struct n3n_pktbuf *pkt = n3n_pktbuf_alloc(N2N_PKT_BUF_SIZE);
-            if(!pkt) {
-                abort();
+            if (!pkt) {
+                abort(); // allocation failure is fatal
             }
             pkt->owner = n3n_pktbuf_owner_rx_pdu;
             edge_read_proto3_udp(eee, info.fd, pkt, now);
@@ -424,66 +413,38 @@ static void handle_fd (const time_t now, const struct fd_info info, struct n3n_r
             struct conn *conn = &connlist[info.connnr];
             conn_read(conn, info.fd);
 
-            switch(conn->state) {
+            switch (conn->state) {
                 case CONN_EMPTY:
                 case CONN_READING:
-                    // These states dont require us to do anything
-                    // TODO:
-                    // - handle reading/sending simultaneous?
                     return;
 
                 case CONN_ERROR:
                 case CONN_CLOSED:
                     conn_close(conn, info.fd);
                     sb_zero(conn->request);
-                    // Let the upper layer realise its connection is gone by
-                    // showing it a zero sized request
-
-                    // TODO: if the upper layer doesnt react properly by
-                    // unregistering the dead filehandle, we leak slots and
-                    // conns here
-
                     edge_read_proto3_tcp(eee, -1, NULL, -1, now);
                     return;
 
                 case CONN_READY: {
-                    int size = ntohs(*(uint16_t *)&conn->request->str);
+                    uint16_t tmp;
+                    memcpy(&tmp, &conn->request->str[0], sizeof(tmp));
+                    size_t size = ntohs(tmp);
+                    edge_read_proto3_tcp(eee, info.fd, (uint8_t *)&conn->request->str[2], size, now);
 
-                    edge_read_proto3_tcp(
-                        eee,
-                        info.fd,
-                        (uint8_t *)&conn->request->str[2],
-                        size,
-                        now
-                    );
-
-                    if(sb_len(conn->request) == (size + 2)) {
-                        // We read exactly one packet
-                        // TODO: this crosses layers by reaching inside the
-                        // conn object
+                    size_t total = (size_t)size + 2;
+                    if (sb_len(conn->request) == total) {
                         sb_zero(conn->request);
                         conn->state = CONN_EMPTY;
-                        return;
+                    } else {
+                        size_t more = sb_len(conn->request) - total;
+#if TRACE_ENABLED && (TRACE_LEVEL >= TRACE_DEBUG)
+                        traceEvent(TRACE_DEBUG, "packet has %zu more bytes", more);
+#endif
+                        memmove(conn->request->str, &conn->request->str[total], more);
+                        conn->request->rd_pos = 0;
+                        conn->request->wr_pos = more;
+                        conn->state = CONN_READING;
                     }
-
-                    // Our buffer contains data beyond the single packet
-
-                    // TODO: this crosses layers by reaching inside the
-                    // conn object
-                    int more = sb_len(conn->request) - (size + 2);
-                    traceEvent(TRACE_DEBUG, "packet has %i more bytes", more);
-                    memmove(
-                        conn->request->str,
-                        &conn->request->str[size + 2],
-                        more
-                    );
-                    conn->request->rd_pos = 0;
-                    conn->request->wr_pos = more;
-                    conn->state = CONN_READING;
-
-                    // FIXME: sometimes we will have an entire next packet in
-                    // the buffer, which means we should not wait for the FD
-                    // to be read ready again
                     return;
                 }
             }
@@ -494,18 +455,14 @@ static void handle_fd (const time_t now, const struct fd_info info, struct n3n_r
             struct conn *conn = &connlist[info.connnr];
             conn_read(conn, info.fd);
 
-            switch(conn->state) {
+            switch (conn->state) {
                 case CONN_EMPTY:
                 case CONN_READING:
-                    // These states dont require us to do anything
-                    // TODO:
-                    // - handle reading/sending simultaneous?
                     return;
 
                 case CONN_READY:
                     mgmt_api_handler(eee, conn);
-                    if(conn->reply_sendpos == 0) {
-                        // Looks like we have finished a write, so we can clean up
+                    if (conn->reply_sendpos == 0) {
                         sb_zero(conn->request);
                     }
                     return;
@@ -513,14 +470,13 @@ static void handle_fd (const time_t now, const struct fd_info info, struct n3n_r
                 case CONN_ERROR:
                 case CONN_CLOSED:
                     conn_close(conn, info.fd);
-                    // TODO: freefd() is doing a fd search, we could optimise
                     fdlist_freefd(info.fd);
+                    return;
             }
             return;
         }
     }
 }
-
 /* TODO: decide if this quick helper is actually useful and needed
  * It was added to try and provide an action to do if select returns an error,
  * but it didnt end up closing connections - and the original error was traced
@@ -544,49 +500,46 @@ static void fdlist_closeidle (const time_t now) {
     }
 }
 
-static void fdlist_check_ready (fd_set *rd, fd_set *wr, const time_t now, struct n3n_runtime_data *eee) {
-    int slot = 0;
-    // A linear scan is not ideal, but until we support things other than
-    // select() it will need to suffice
-    while(slot < MAX_HANDLES) {
-        int fd = fdlist[slot].fd;
-        if(fd == -1) {
-            slot++;
-            continue;
-        }
-        if(FD_ISSET(fd, rd)) {
+static void fdlist_check_ready(fd_set *rd, fd_set *wr, const time_t now, struct n3n_runtime_data *eee) {
+    for (int slot = 0; slot < MAX_HANDLES; slot++) {
+        const int fd = fdlist[slot].fd;
+        if (fd == -1) continue;
+
+        const int connnr = fdlist[slot].connnr;
+        struct conn *conn = (connnr != -1) ? &connlist[connnr] : NULL;
+
+        /* Check for readable data */
+        if (FD_ISSET(fd, rd)) {
             fdlist[slot].stats_reads++;
             handle_fd(now, fdlist[slot], eee);
         }
-        if(FD_ISSET(fd, wr)) {
-            // We should not be listening on this socket if there is no
-            // connnr assigned, but paranoia..
-            if(fdlist[slot].connnr == -1) {
+
+        /* Check for writable data */
+        if (FD_ISSET(fd, wr)) {
+            if (connnr == -1) {
+#if TRACE_ENABLED && (TRACE_LEVEL >= TRACE_DEBUG)
                 traceEvent(TRACE_DEBUG, "writer bad connnr");
-                slot++;
+#endif
                 continue;
             }
 
-            struct conn *conn = &connlist[fdlist[slot].connnr];
-
-            // TODO: track the stats on writes?
             conn_write(conn, fd);
 
-            if(conn->reply_sendpos == 0) {
-                // Looks like we have finished a write, so we can clean up
+            /* Clear request buffer if write is complete */
+            if (conn->reply_sendpos == 0) {
                 sb_zero(conn->request);
             }
         }
 
-        if(fdlist[slot].connnr != -1) {
-            int timeout = 60;
-            struct conn *conn = &connlist[fdlist[slot].connnr];
-            bool closed = conn_closeidle(conn, fd, now, timeout);
-            if(closed) {
+        /* Close idle connections (only if connection exists) */
+        if (conn) {
+            // Only check idle timeout if we did I/O or periodically
+            // But for simplicity and correctness, we keep per-loop check
+            // (60s timeout → check is cheap)
+            if (conn_closeidle(conn, fd, now, 60)) {
                 fdlist_freefd(fd);
             }
         }
-        slot++;
     }
 }
 
@@ -596,69 +549,57 @@ static time_t last_mallinfo;
 #endif
 #endif
 
-int mainloop_runonce (struct n3n_runtime_data *eee) {
-    fd_set rd;
-    fd_set wr;
-
+int mainloop_runonce(struct n3n_runtime_data *eee) {
     metrics.mainloop++;
 
+    fd_set rd, wr;
     FD_ZERO(&rd);
     FD_ZERO(&wr);
     int maxfd = fdlist_fd_set(&rd, &wr);
 
-    // FIXME:
-    // unlock the windows tun reader thread before select() and lock it
-    // again after select().  It currently works by accident, but the
-    // structures it manipulates are not thread-safe, so try to make it
-    // work by /design/
-
-    struct timeval wait_time;
-    if(eee->sn_wait) {
-        wait_time.tv_sec = (SOCKET_TIMEOUT_INTERVAL_SECS / 10 + 1);
-    } else {
-        wait_time.tv_sec = (SOCKET_TIMEOUT_INTERVAL_SECS);
-    }
-    wait_time.tv_usec = 0;
+    struct timeval wait_time = {
+        .tv_sec = eee->sn_wait ? (SOCKET_TIMEOUT_INTERVAL_SECS / 10 + 1) : SOCKET_TIMEOUT_INTERVAL_SECS,
+        .tv_usec = 0
+    };
 
     int ready = select(maxfd + 1, &rd, &wr, NULL, &wait_time);
 
-    // One timestamp to use for this entire loop iteration
-    time_t now = time(NULL);
-
-    if(ready == -1) {
+    if (ready == -1) {
+#if TRACE_ENABLED && (TRACE_LEVEL >= TRACE_ERROR)
         traceEvent(TRACE_ERROR, "select errno=%i", errno);
+#endif
+        time_t now = time(NULL);
         fdlist_closeidle(now);
         return -1;
     }
 
-    if(ready < 1) {
-        // Nothing ready
-        return ready;
+    if (ready == 0) {
+        // Timeout — nothing ready
+        return 0;
     }
 
+    // Only get time if we have I/O to process
+    time_t now = time(NULL);
     fdlist_check_ready(&rd, &wr, now, eee);
 
-#ifdef DEBUG_MALLOC
-#ifdef __GLIBC__
-    if(getTraceLevel() >= TRACE_DEBUG) {
-        if((now & ~0x3f) > last_mallinfo) {
+#if defined(DEBUG_MALLOC) && defined(__GLIBC__)
+    // Only enable if both debug malloc AND tracing are on
+    #if TRACE_ENABLED && (TRACE_LEVEL >= TRACE_DEBUG)
+    {
+        static time_t last_mallinfo = 0;
+        if ((now & ~0x3f) > last_mallinfo) {
             last_mallinfo = now;
             struct mallinfo2 mi = mallinfo2();
-            traceEvent(
-                TRACE_DEBUG,
-                "mallinfo: area=%i uordblks=%i, fordblks=%i, keepcost=%i",
-                mi.arena,
-                mi.uordblks,
-                mi.fordblks,
-                mi.keepcost
-            );
+            traceEvent(TRACE_DEBUG,
+                "mallinfo: arena=%i uordblks=%i, fordblks=%i, keepcost=%i",
+                mi.arena, mi.uordblks, mi.fordblks, mi.keepcost);
 
-            fprintf(stderr,"===malloc_info start===\n");
+            fprintf(stderr, "===malloc_info start===\n");
             malloc_info(0, stderr);
-            fprintf(stderr,"===malloc_info end===\n");
+            fprintf(stderr, "===malloc_info end===\n");
         }
     }
-#endif
+    #endif
 #endif
 
     return ready;
