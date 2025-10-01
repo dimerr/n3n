@@ -5,11 +5,11 @@
 
 all: libconnslot.a
 
-CFLAGS+=-Wall -Wextra -Werror -g -DMETRICS
+CFLAGS+=-Wall -Wextra -Werror -g -DMETRICS -fno-strict-aliasing
 
 COVERAGEDIR?=coverage
 ifdef COVERAGE
-CFLAGS+=-fprofile-arcs
+CFLAGS+=-fprofile-arcs -fno-strict-aliasing
 CFLAGS+=-ftest-coverage
 LDFLAGS+=--coverage
 endif
